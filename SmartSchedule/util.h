@@ -14,6 +14,10 @@ struct Offering {
     QString teacher;
     QVector<int> times = QVector<int>(7, 0); // 由7个二进制下13位的整数表示每周内的开课时间
     int weeks;  // 是1个2进制下18位的整数表示开课周次
+
+    // --- 新增成员，用于存储解码后的数据 ---
+    QList<int> decoded_weeks;      // 存储解码后的具体周次列表
+    QList<QList<int>> decoded_times; // 存储解码后的每日节次列表
 };
 
 struct Course {

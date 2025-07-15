@@ -89,17 +89,150 @@ void MainWindow::on_action_load_triggered()
 // 选中产生方案时
 void MainWindow::on_action_generate_triggered()
 {
-/*
-    数据含义
-    int m_totalCredits;    // 总学分下限
-    int m_semesterCreditsLimit ;  // 单学期学分上限
-    QVector<QVector<QVector<bool>>> m_mainScheduleData; // 无课状态表
-    QList<Course> m_allCourses; // 所有课程的列表
-    QList<ScheduledCourse> m_generatedSchedule; // 生成的选课方案
-    QMap<QString,Course> courseMap;   // 建立课程id到对象的映射
- */
+    if (m_allCourses.isEmpty()) {
+        QMessageBox::warning(this, "错误", "请先通过“文件”->“导入课程”来加载课程列表。");
+        return;
+    }
 
+    // 1. 数据初始化
+    m_generatedSchedule.clear();
+    courseMap.clear();
+    for (const auto& course : m_allCourses) {
+        courseMap[course.id] = course;
+    }
+
+    QList<Course> coursesToSchedule = m_allCourses;
+
+    // 2. 扩展功能：考虑优先级 (Compulsory vs. Elective)
+    std::sort(coursesToSchedule.begin(), coursesToSchedule.end(), [](const Course &a, const Course &b) {
+        if (a.required == "Compulsory" && b.required != "Compulsory") return true;
+        if (a.required != "Compulsory" && b.required == "Compulsory") return false;
+        return a.prerequisites.size() < b.prerequisites.size();
+    });
+
+    int currentTotalCredits = 0;
+    QVector<int> semesterCredits(numSemesters, 0);
+
+    for (const auto& course : coursesToSchedule) {
+        ScheduledCourse sc;
+        sc.course_id = course.id;
+        sc.semester = -1;
+        m_generatedSchedule.append(sc);
+    }
+
+    // 3. 核心排课算法
+    bool madeProgressInLastPass = true;
+    while(madeProgressInLastPass) {
+        madeProgressInLastPass = false;
+        for (int i = 0; i < m_generatedSchedule.size(); ++i) {
+            if (m_generatedSchedule[i].semester != -1) continue;
+
+            const Course& course = courseMap[m_generatedSchedule[i].course_id];
+
+            bool prereqsMet = true;
+            int earliestPossibleSemester = 0;
+            for (const QString &prereq_id : course.prerequisites) {
+                auto it = std::find_if(m_generatedSchedule.begin(), m_generatedSchedule.end(),
+                                       [&](const ScheduledCourse& s){ return s.course_id == prereq_id; });
+                if (it != m_generatedSchedule.end()) {
+                    if (it->semester == -1) {
+                        prereqsMet = false;
+                        break;
+                    }
+                    earliestPossibleSemester = qMax(earliestPossibleSemester, it->semester + 1);
+                }
+            }
+            if (!prereqsMet) continue;
+
+            for (int sem = earliestPossibleSemester; sem < numSemesters; ++sem) {
+                // ==================== 新增逻辑：检查开课学期是否匹配 ====================
+                // Autumn (秋季) -> 对应学期索引 0, 2, 4, 6
+                // Spring (春季) -> 对应学期索引 1, 3, 5, 7
+                bool isAutumnSemester = (sem % 2 == 0);
+                bool isSpringSemester = (sem % 2 != 0);
+
+                if (course.semester == "Autumn" && !isAutumnSemester) {
+                    continue; // 课程是秋季开课，但当前是春季学期，跳过
+                }
+                if (course.semester == "Spring" && !isSpringSemester) {
+                    continue; // 课程是春季开课，但当前是秋季学期，跳过
+                }
+                // =======================================================================
+
+                if (m_semesterCreditsLimit > 0 && (semesterCredits[sem] + course.credit > m_semesterCreditsLimit)) {
+                    continue;
+                }
+
+                bool courseScheduled = false;
+                for (const auto& offering : std::as_const(course.offerings)) {
+                    bool isConflict = false;
+
+                    for (const auto& scheduledCourse : std::as_const(m_generatedSchedule)) {
+                        if (scheduledCourse.semester == sem) {
+                            const Course& otherCourse = courseMap[scheduledCourse.course_id];
+                            const Offering* otherOffering = nullptr;
+                            for (int j = 0; j < otherCourse.offerings.size(); ++j) {
+                                if (otherCourse.offerings[j].id == scheduledCourse.class_id) {
+                                    otherOffering = &otherCourse.offerings[j];
+                                    break;
+                                }
+                            }
+                            if (otherOffering && (offering.weeks & otherOffering->weeks)) {
+                                for (int day = 0; day < 7; ++day) {
+                                    if ((offering.times[day] & otherOffering->times[day])) {
+                                        isConflict = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (isConflict) break;
+                    }
+                    if (isConflict) continue;
+
+                    if (!m_mainScheduleData.empty()) {
+                        for (int week = 0; week < numWeeks; ++week) {
+                            if ((offering.weeks >> week) & 1) {
+                                for (int day = 0; day < numDays; ++day) {
+                                    for (int slot = 0; slot < numSlots; ++slot) {
+                                        if ((offering.times[day] >> slot) & 1) {
+                                            if (m_mainScheduleData[sem][week][day * numSlots + slot]) {
+                                                isConflict = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (isConflict) break;
+                                }
+                            }
+                            if (isConflict) break;
+                        }
+                    }
+                    if (isConflict) continue;
+
+                    m_generatedSchedule[i].semester = sem;
+                    m_generatedSchedule[i].class_id = offering.id;
+                    semesterCredits[sem] += course.credit;
+                    currentTotalCredits += course.credit;
+                    madeProgressInLastPass = true;
+                    courseScheduled = true;
+                    break;
+                }
+                if (courseScheduled) break;
+            }
+        }
+    }
+
+    // 4. 结果反馈
+    if (currentTotalCredits < m_totalCredits) {
+        QMessageBox::warning(this, "生成方案可能未完成", QString("无法生成满足 %1 总学分下限的方案。当前已排课程总学分: %2").arg(m_totalCredits).arg(currentTotalCredits));
+    } else {
+        QMessageBox::information(this, "成功", QString("成功生成选课方案，总学分: %1").arg(currentTotalCredits));
+    }
+
+    updateScheduleView();
 }
+
 
 // 选中重置方案时
 void MainWindow::on_action_reset_triggered()
